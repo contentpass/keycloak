@@ -22,6 +22,7 @@ import org.keycloak.Config;
 import org.keycloak.OAuth2Constants;
 import org.keycloak.authentication.*;
 import org.keycloak.authentication.actiontoken.verifyemail.VerifyEmailActionToken;
+import org.keycloak.common.util.RandomString;
 import org.keycloak.common.util.Time;
 import org.keycloak.email.EmailException;
 import org.keycloak.email.EmailTemplateProvider;
@@ -32,10 +33,14 @@ import org.keycloak.events.EventType;
 import org.keycloak.forms.login.LoginFormsProvider;
 import org.keycloak.models.*;
 import org.keycloak.services.Urls;
+import org.keycloak.services.messages.Messages;
 import org.keycloak.services.validation.Validation;
 
 import org.keycloak.sessions.AuthenticationSessionCompoundId;
 import org.keycloak.sessions.AuthenticationSessionModel;
+
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import javax.ws.rs.core.*;
@@ -58,6 +63,7 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
         AuthenticationSessionModel authSession = context.getAuthenticationSession();
 
         if (context.getUser().isEmailVerified()) {
+            logger.warnf("email is verified");
             context.success();
             authSession.removeAuthNote(Constants.VERIFY_EMAIL_KEY);
             return;
@@ -65,6 +71,7 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
 
         String email = context.getUser().getEmail();
         if (Validation.isBlank(email)) {
+            logger.warnf("email is blank");
             context.ignore();
             return;
         }
@@ -74,10 +81,12 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
 
         // Do not allow resending e-mail by simple page refresh, i.e. when e-mail sent, it should be resent properly via email-verification endpoint
         if (! Objects.equals(authSession.getAuthNote(Constants.VERIFY_EMAIL_KEY), email)) {
+            logger.warnf("key mismatch");
             authSession.setAuthNote(Constants.VERIFY_EMAIL_KEY, email);
             EventBuilder event = context.getEvent().clone().event(EventType.SEND_VERIFY_EMAIL).detail(Details.EMAIL, email);
             challenge = sendVerifyEmail(context.getSession(), loginFormsProvider, context.getUser(), context.getAuthenticationSession(), event);
         } else {
+            logger.warnf("challenge verify email form");
             challenge = loginFormsProvider.createResponse(UserModel.RequiredAction.VERIFY_EMAIL);
         }
 
@@ -87,12 +96,40 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
 
     @Override
     public void processAction(RequiredActionContext context) {
-        logger.debugf("Re-sending email requested for user: %s", context.getUser().getUsername());
+        EventBuilder event = context.getEvent().clone().event(EventType.VERIFY_EMAIL).detail(Details.EMAIL, context.getUser().getEmail());
+        String code = context.getAuthenticationSession().getAuthNote(Constants.VERIFY_EMAIL_CODE);
+        if (code == null) {
+            logger.warnf("code is null");
+            requiredActionChallenge(context);
+            return;
+        }
 
-        // This will allow user to re-send email again
-        context.getAuthenticationSession().removeAuthNote(Constants.VERIFY_EMAIL_KEY);
+        MultivaluedMap<String, String> formData = context.getHttpRequest().getDecodedFormParameters();
+        String emailCode = formData.getFirst("code");
 
-        requiredActionChallenge(context);
+        if (!code.equals(emailCode)) {
+            // FIXME: Create error message
+            logger.warnf("code mismatch %s != %s", code, emailCode);
+            requiredActionChallenge(context);
+            event.error(Errors.INVALID_CODE);
+            return;
+        }
+        logger.warn("success");
+
+        UserModel user = context.getUser();
+        user.setEmailVerified(true);
+        user.removeRequiredAction(UserModel.RequiredAction.VERIFY_EMAIL);
+        // authSession.removeRequiredAction(UserModel.RequiredAction.VERIFY_EMAIL);
+
+        event.success();
+        context.success();
+
+        // logger.debugf("Re-sending email requested for user: %s", context.getUser().getUsername());
+
+        // // This will allow user to re-send email again
+        // context.getAuthenticationSession().removeAuthNote(Constants.VERIFY_EMAIL_KEY);
+
+        // requiredActionChallenge(context);
     }
 
 
@@ -137,17 +174,12 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
 
     private Response sendVerifyEmail(KeycloakSession session, LoginFormsProvider forms, UserModel user, AuthenticationSessionModel authSession, EventBuilder event) throws UriBuilderException, IllegalArgumentException {
         RealmModel realm = session.getContext().getRealm();
-        UriInfo uriInfo = session.getContext().getUri();
 
-        int validityInSecs = realm.getActionTokenGeneratedByUserLifespan(VerifyEmailActionToken.TOKEN_TYPE);
-        int absoluteExpirationInSecs = Time.currentTime() + validityInSecs;
+        String code = RandomString.randomCode(8);
+        authSession.setAuthNote(Constants.VERIFY_EMAIL_CODE, code);
 
-        String authSessionEncodedId = AuthenticationSessionCompoundId.fromAuthSession(authSession).getEncodedId();
-        VerifyEmailActionToken token = new VerifyEmailActionToken(user.getId(), absoluteExpirationInSecs, authSessionEncodedId, user.getEmail());
-        UriBuilder builder = Urls.actionTokenBuilder(uriInfo.getBaseUri(), token.serialize(session, realm, uriInfo),
-                authSession.getClient().getClientId(), authSession.getTabId());
-        String link = builder.build(realm.getName()).toString();
-        long expirationInMinutes = TimeUnit.SECONDS.toMinutes(validityInSecs);
+        Map<String, Object> attributes = new HashMap<>();
+        attributes.put("code", code);
 
         try {
             session
@@ -155,7 +187,7 @@ public class VerifyEmail implements RequiredActionProvider, RequiredActionFactor
               .setAuthenticationSession(authSession)
               .setRealm(realm)
               .setUser(user)
-              .sendVerifyEmail(link, expirationInMinutes);
+              .send("emailVerificationSubject", "email-verification-with-code.ftl", attributes);
             event.success();
         } catch (EmailException e) {
             logger.error("Failed to send verification email", e);
